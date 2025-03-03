@@ -39,6 +39,9 @@ from lm_eval.models.utils import (
     stop_sequences_criteria,
 )
 
+from models.llama_kivi import LlamaForCausalLM_KIVI
+from transformers import LlamaConfig
+
 
 eval_logger = logging.getLogger(__name__)
 
@@ -560,6 +563,10 @@ class HFLM(TemplateLM):
         """
 
         model_kwargs = kwargs if kwargs else {}
+        
+        config_path = model_kwargs.get("config_path", None)
+        if config_path is not None:
+            del model_kwargs["config_path"]
 
         model_kwargs.update(
             self._get_accelerate_args(
@@ -583,15 +590,25 @@ class HFLM(TemplateLM):
                         model_kwargs["bnb_4bit_compute_dtype"] = get_dtype(
                             model_kwargs["bnb_4bit_compute_dtype"]
                         )
-
-            self._model = self.AUTO_MODEL_CLASS.from_pretrained(
-                pretrained,
-                revision=revision,
-                torch_dtype=get_dtype(dtype),
-                trust_remote_code=trust_remote_code,
-                gguf_file=gguf_file,
-                **model_kwargs,
-            )
+            
+            if config_path is not None:
+                config = LlamaConfig.from_pretrained(config_path)
+                eval_logger.warn(f"<squat> creating model with config:\n{config}")
+                self._model = LlamaForCausalLM_KIVI.from_pretrained(
+                    pretrained_model_name_or_path=pretrained,
+                    config=config,
+                    low_cpu_mem_usage=True,
+                    torch_dtype=torch.float16,
+                ).cuda()
+            else:
+                self._model = self.AUTO_MODEL_CLASS.from_pretrained(
+                    pretrained,
+                    revision=revision,
+                    torch_dtype=get_dtype(dtype),
+                    trust_remote_code=trust_remote_code,
+                    gguf_file=gguf_file,
+                    **model_kwargs,
+                )
         else:
             if autogptq and gptqmodel:
                 raise ValueError(
@@ -723,6 +740,14 @@ class HFLM(TemplateLM):
             else:
                 # get the HF hub name via accessor on model
                 model_name = self.model.name_or_path
+            
+            kwargs = {
+                "use_fast": True,
+                "padding_side": "left",
+                "trust_remote_code": True,
+            }
+            eval_logger.warn(f"<squat> creating tokenizer with kwargs:\n{kwargs}")
+            
             self.tokenizer = transformers.AutoTokenizer.from_pretrained(
                 model_name, **kwargs
             )
