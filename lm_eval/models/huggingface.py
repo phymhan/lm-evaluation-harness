@@ -39,7 +39,6 @@ from lm_eval.models.utils import (
     stop_sequences_criteria,
 )
 
-from models.llama_kivi import LlamaForCausalLM_KIVI
 from transformers import LlamaConfig
 
 
@@ -593,13 +592,38 @@ class HFLM(TemplateLM):
             
             if config_path is not None:
                 config = LlamaConfig.from_pretrained(config_path)
-                eval_logger.warn(f"<squat> creating model with config:\n{config}")
-                self._model = LlamaForCausalLM_KIVI.from_pretrained(
+                if "kivi" in config.method.lower():
+                    eval_logger.warn(f"<kivi> creating model with config:\n{config}")
+                    if config.architectures[0]=='MistralForCausalLM':
+                        from models.mistral_kivi import MistralForCausalLM_KIVI as KV_MODEL
+                    elif config.architectures[0]=='LlamaForCausalLM':
+                        from models.llama_kivi import LlamaForCausalLM_KIVI as KV_MODEL
+                    else:
+                        raise ValueError(f"Unsupported model architecture: {config.architectures[0]}")
+                elif "squat" in config.method.lower():
+                    eval_logger.warn(f"<squat> creating model with config:\n{config}")
+                    if config.architectures[0]=='MistralForCausalLM':
+                        from models.mistral_squat import MistralForCausalLM_SQuat as KV_MODEL
+                    elif config.architectures[0]=='LlamaForCausalLM':
+                        from models.llama_squat import LlamaForCausalLM_SQuat as KV_MODEL
+                    else:
+                        raise ValueError(f"Unsupported model architecture: {config.architectures[0]}")
+                else:
+                    raise ValueError(f"Unsupported method: {config.method}")
+                self._model = KV_MODEL.from_pretrained(
                     pretrained_model_name_or_path=pretrained,
                     config=config,
                     low_cpu_mem_usage=True,
                     torch_dtype=torch.float16,
                 ).cuda()
+                if not getattr(config, "no_hadamard", False):
+                    import sys
+                    import os
+                    current_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+                    sys.path.append(current_dir)
+                    from rotation_utils import rotate_model_v
+                    rotate_model_v(self._model, config)
+                    print("Rotated model")
             else:
                 self._model = self.AUTO_MODEL_CLASS.from_pretrained(
                     pretrained,
