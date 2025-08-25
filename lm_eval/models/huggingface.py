@@ -608,6 +608,15 @@ class HFLM(TemplateLM):
                         from models.llama_squat import LlamaForCausalLM_SQuat as KV_MODEL
                     else:
                         raise ValueError(f"Unsupported model architecture: {config.architectures[0]}")
+                elif "itkv" in config.method.lower():
+                    eval_logger.warn(f"<itkv> creating model with config:\n{config}")
+                    if config.architectures[0]=='MistralForCausalLM':
+                        from models.mistral_itkv import MistralForCausalLM_ITKV as KV_MODEL
+                    elif config.architectures[0]=='LlamaForCausalLM':
+                        from models.llama_itkv import LlamaForCausalLM_ITKV as KV_MODEL
+                        # config.use_side_info = False
+                    else:
+                        raise ValueError(f"Unsupported model architecture: {config.architectures[0]}")
                 else:
                     raise ValueError(f"Unsupported method: {config.method}")
                 self._model = KV_MODEL.from_pretrained(
@@ -616,14 +625,67 @@ class HFLM(TemplateLM):
                     low_cpu_mem_usage=True,
                     torch_dtype=torch.float16,
                 ).cuda()
-                if not getattr(config, "no_hadamard", False):
-                    import sys
+                if "itkv" in config.method.lower():
                     import os
-                    current_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-                    sys.path.append(current_dir)
-                    from rotation_utils import rotate_model_v
-                    rotate_model_v(self._model, config)
-                    print("Rotated model")
+                    ae_ckpt_path = getattr(config, "ae_ckpt_path", None)
+                    layerwise_ckpt_path = getattr(config, "layerwise_ckpt_path", None)
+                    legacy_ckpt_path = getattr(config, "legacy_ckpt_path", None)
+                    if ae_ckpt_path is not None and os.path.exists(ae_ckpt_path):
+                        all_ae = torch.load(ae_ckpt_path)
+                        for layer_idx in config.itkv_layer_indices:
+                            key = f'layer_{layer_idx}'
+                            if key in all_ae:
+                                all_ae[key] = {k: v.to(torch.float16) for k, v in all_ae[key].items()}
+                                self._model.model.layers[layer_idx].self_attn.autoencoder.load_state_dict(all_ae[key])
+                                print(f"Loaded AE from {ae_ckpt_path} for {key}")
+                            else:
+                                print(f"Warning: {key} not found in {ae_ckpt_path}")
+                    elif layerwise_ckpt_path is not None and os.path.exists(layerwise_ckpt_path):
+                        for layer_idx in config.itkv_layer_indices:
+                            ckpt = torch.load(os.path.join(layerwise_ckpt_path, f"layer_{layer_idx}.pth"))
+                            ckpt['autoencoder']['head_mlps.1.W_up.weight'] = ckpt['autoencoder']['head_mlps.1.W_up.weight']
+                            ckpt['autoencoder']['head_mlps.0.W_down.weight'] = ckpt['autoencoder']['head_mlps.0.W_down.weight']
+                            self._model.model.layers[layer_idx].self_attn.autoencoder.load_state_dict(ckpt['autoencoder'])
+                            print(f"Loaded layerwise AE from {layerwise_ckpt_path}")
+                    elif legacy_ckpt_path is not None:
+                        from glob import glob
+                        for layer_idx in config.itkv_layer_indices:
+                            template = legacy_ckpt_path
+                            try:
+                                resolved = template.format(layer_idx=layer_idx)
+                            except Exception:
+                                resolved = template
+                            if any(ch in resolved for ch in ['*', '?', '[']):
+                                cand_files = sorted(glob(resolved), key=os.path.getmtime, reverse=True)
+                            elif os.path.isdir(resolved):
+                                cand_files = sorted(glob(os.path.join(resolved, "*.pth")), key=os.path.getmtime, reverse=True)
+                            elif os.path.isfile(resolved):
+                                cand_files = [resolved]
+                            else:
+                                cand_files = sorted(glob(os.path.join(resolved, "ckpts", "*.pth")), key=os.path.getmtime, reverse=True)
+                            if len(cand_files) == 0:
+                                print(f"Warning: no legacy ckpt matched for layer {layer_idx} with pattern '{resolved}'")
+                                continue
+                            fpath = cand_files[0]
+                            ckpt = torch.load(fpath, map_location='cpu')
+                            if isinstance(ckpt, dict) and 'autoencoder' in ckpt:
+                                state = ckpt['autoencoder']
+                            elif isinstance(ckpt, dict) and f'layer_{layer_idx}' in ckpt:
+                                state = ckpt[f'layer_{layer_idx}']
+                            else:
+                                state = ckpt
+                            self._model.model.layers[layer_idx].self_attn.autoencoder.load_state_dict(state)
+                            print(f"Loaded legacy AE from {fpath} for layer {layer_idx}")
+                    else:
+                        print(f"Warning: {ae_ckpt_path} not found")
+                # if not getattr(config, "no_hadamard", False):
+                #     import sys
+                #     import os
+                #     current_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+                #     sys.path.append(current_dir)
+                #     from rotation_utils import rotate_model_v
+                #     rotate_model_v(self._model, config)
+                #     print("Rotated model")
             else:
                 self._model = self.AUTO_MODEL_CLASS.from_pretrained(
                     pretrained,
