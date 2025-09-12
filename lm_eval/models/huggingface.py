@@ -627,9 +627,9 @@ class HFLM(TemplateLM):
                 ).cuda()
                 if "itkv" in config.method.lower():
                     import os
-                    ae_ckpt_path = getattr(config, "ae_ckpt_path", None)
-                    layerwise_ckpt_path = getattr(config, "layerwise_ckpt_path", None)
-                    legacy_ckpt_path = getattr(config, "legacy_ckpt_path", None)
+                    ae_ckpt_path = model_kwargs.get("ae_ckpt_path", getattr(config, "ae_ckpt_path", None))
+                    layerwise_ckpt_path = model_kwargs.get("layerwise_ckpt_path", getattr(config, "layerwise_ckpt_path", None))
+                    legacy_ckpt_path = model_kwargs.get("legacy_ckpt_path", getattr(config, "legacy_ckpt_path", None))
                     if ae_ckpt_path is not None and os.path.exists(ae_ckpt_path):
                         all_ae = torch.load(ae_ckpt_path)
                         for layer_idx in config.itkv_layer_indices:
