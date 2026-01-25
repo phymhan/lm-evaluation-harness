@@ -1,4 +1,7 @@
 import copy
+import importlib
+import importlib.util
+import hashlib
 import logging
 import os
 from datetime import timedelta
@@ -40,7 +43,6 @@ from lm_eval.models.utils import (
 )
 
 from transformers import LlamaConfig
-
 
 eval_logger = logging.getLogger(__name__)
 
@@ -562,6 +564,67 @@ class HFLM(TemplateLM):
         """
 
         model_kwargs = kwargs if kwargs else {}
+
+        # Optional custom generation routing.
+        # If provided, this replaces `self.model.generate(...)` inside `_model_generate()`.
+        #
+        # Format:
+        # - `custom_generate=<python.module.path>:<callable_name>`
+        # - `custom_generate=./path/to/file.py:<callable_name>` (loads from file)
+        # The callable must be: fn(model, **hf_generate_kwargs) -> torch.LongTensor (token ids)
+        self._custom_generate = model_kwargs.pop("custom_generate", None)
+        self._custom_generate_fn = None
+        # Defaults that should be forwarded to the custom generator (not to from_pretrained()).
+        self._custom_generate_defaults: Dict[str, object] = {}
+        if self._custom_generate is not None:
+            if not isinstance(self._custom_generate, str) or ":" not in self._custom_generate:
+                raise ValueError(
+                    "custom_generate must be a string like 'some.module:some_function'"
+                )
+            mod_name, fn_name = self._custom_generate.split(":", 1)
+            # Support loading from a local file path like ./generate.py:my_fn
+            if mod_name.endswith(".py") or "/" in mod_name or mod_name.startswith("."):
+                fpath = os.path.abspath(mod_name)
+                if not os.path.isfile(fpath):
+                    raise ValueError(f"custom_generate file not found: {mod_name}")
+                module_key = hashlib.sha256(fpath.encode("utf-8")).hexdigest()[:12]
+                module_name = f"lm_eval_custom_generate_{Path(fpath).stem}_{module_key}"
+                spec = importlib.util.spec_from_file_location(module_name, fpath)
+                if spec is None or spec.loader is None:
+                    raise ValueError(f"Failed to load custom_generate module from file: {fpath}")
+                mod = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(mod)  # type: ignore[attr-defined]
+            else:
+                mod = importlib.import_module(mod_name)
+            fn = getattr(mod, fn_name, None)
+            if fn is None or not callable(fn):
+                raise ValueError(
+                    f"custom_generate refers to non-callable '{fn_name}' in module '{mod_name}'"
+                )
+            self._custom_generate_fn = fn
+
+            # Do not forward generation-specific args into `from_pretrained()` / model __init__.
+            # These can be provided via --model_args as defaults, and/or via --gen_kwargs per request.
+            for k in (
+                "mask_id",
+                "gen_length",
+                "block_length",
+                "denoising_steps",
+                "temperature",
+                "top_k",
+                "top_p",
+                "remasking_strategy",
+                "confidence_threshold",
+                "eb_threshold",
+                "stopping_criteria_idx",
+                "return_forward_stats",
+                "cache_ver",
+                "draft_ver",
+                "ssd_ratio_tempering_factor",
+                "min_ssd_span_length",
+            ):
+                if k in model_kwargs:
+                    self._custom_generate_defaults[k] = model_kwargs.pop(k)
         
         config_path = model_kwargs.get("config_path", None)
         if config_path is not None:
@@ -626,7 +689,6 @@ class HFLM(TemplateLM):
                     torch_dtype=torch.float16,
                 ).cuda()
                 if "itkv" in config.method.lower():
-                    import os
                     ae_ckpt_path = model_kwargs.get("ae_ckpt_path", getattr(config, "ae_ckpt_path", None))
                     layerwise_ckpt_path = model_kwargs.get("layerwise_ckpt_path", getattr(config, "layerwise_ckpt_path", None))
                     legacy_ckpt_path = model_kwargs.get("legacy_ckpt_path", getattr(config, "legacy_ckpt_path", None))
@@ -989,6 +1051,39 @@ class HFLM(TemplateLM):
                 return self.model(inps).logits
 
     def _model_generate(self, context, max_length, stop, **generation_kwargs):
+        # If a custom generator is provided, call it with *your* expected kwargs.
+        # In particular:
+        # - Do NOT apply HF temperature/do_sample normalization.
+        # - Translate HF's `max_length` into `gen_length` (new tokens).
+        # - Pass `attention_mask` if present.
+        # - Provide `stopping_criteria_idx` (token ids) defaulting to EOS.
+        # - Pass through any other kwargs from CLI.
+        if getattr(self, "_custom_generate_fn", None) is not None:
+            fn = self._custom_generate_fn
+
+            # Work on a copy: do not mutate generation_kwargs.
+            custom_kwargs = {}
+            custom_kwargs.update(getattr(self, "_custom_generate_defaults", {}) or {})
+            custom_kwargs.update(generation_kwargs)
+
+            # Allow explicit gen_length override (e.g. via --gen_kwargs gen_length=...).
+            if "gen_length" not in custom_kwargs:
+                gen_length = int(max_length) - int(context.shape[1])
+                custom_kwargs["gen_length"] = max(0, int(gen_length))
+
+            # Default stopping token ids if not explicitly provided.
+            if "stopping_criteria_idx" not in custom_kwargs:
+                custom_kwargs["stopping_criteria_idx"] = (
+                    [int(self.tokenizer.eos_token_id)]
+                    if self.tokenizer.eos_token_id is not None
+                    else None
+                )
+
+            # Always provide input_ids. Also pass attention_mask through if present.
+            custom_kwargs["input_ids"] = context
+            return fn(self.model, **custom_kwargs)
+
+        # Default HF generation path.
         # temperature = 0.0 if not set
         # if do_sample is false and temp==0.0:
         # remove temperature, as do_sample=False takes care of this
@@ -1002,6 +1097,7 @@ class HFLM(TemplateLM):
 
         if do_sample is False and generation_kwargs.get("temperature") == 0.0:
             generation_kwargs.pop("temperature")
+
         # build stopping criteria
         stopping_criteria = stop_sequences_criteria(
             self.tokenizer, stop, context.shape[1], context.shape[0]
