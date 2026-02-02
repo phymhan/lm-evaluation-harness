@@ -606,22 +606,35 @@ class HFLM(TemplateLM):
             # Do not forward generation-specific args into `from_pretrained()` / model __init__.
             # These can be provided via --model_args as defaults, and/or via --gen_kwargs per request.
             for k in (
-                "mask_id",
-                "gen_length",
+                # common args for block-diffusion
+                "mask_id",  # 151669 for SDAR, 151665 for Fast-dLLM v2
+                "temperature",
+                "top_p",
+                "max_gen_toks",  # lm_eval's max_new_tokens/gen_length
+                # for SDAR
+                "gen_length",  # will be overridden by max_gen_toks
                 "block_length",
                 "denoising_steps",
-                "temperature",
                 "top_k",
-                "top_p",
                 "remasking_strategy",
                 "confidence_threshold",
                 "eb_threshold",
                 "stopping_criteria_idx",
                 "return_forward_stats",
+                # for Fast-dLLM v2
+                "threshold",
+                "max_new_tokens",  # will be overridden by max_gen_toks
+                "max_length",
+                "block_size",
+                "small_block_size",
+                "use_block_cache",
+                "use_ssd_cache",
+                # additional for SSD
                 "cache_ver",
                 "draft_ver",
                 "ssd_ratio_tempering_factor",
                 "min_ssd_span_length",
+                "allow_resample",
             ):
                 if k in model_kwargs:
                     self._custom_generate_defaults[k] = model_kwargs.pop(k)
