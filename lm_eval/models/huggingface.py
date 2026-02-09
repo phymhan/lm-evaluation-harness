@@ -565,6 +565,65 @@ class HFLM(TemplateLM):
 
         model_kwargs = kwargs if kwargs else {}
 
+        # ── helper: resolve a "module:name" string to a Python object ──
+        def _resolve_dotted_import(spec_str: str, *, label: str = "custom import"):
+            """Resolve ``'module_or_path:attribute_name'`` to a Python object.
+
+            *label* is used in error messages (e.g. ``"custom_generate"``).
+            Returns ``(module, attribute)`` tuple.
+            """
+            if not isinstance(spec_str, str) or ":" not in spec_str:
+                raise ValueError(
+                    f"{label} must be a string like 'some.module:SomeName'"
+                )
+            mod_name, attr_name = spec_str.split(":", 1)
+            # Support loading from a local file path like ./my_module.py:MyClass
+            if mod_name.endswith(".py") or "/" in mod_name or mod_name.startswith("."):
+                fpath = os.path.abspath(mod_name)
+                if not os.path.isfile(fpath):
+                    raise ValueError(f"{label} file not found: {mod_name}")
+                # Add the file's parent directory to sys.path so that sibling
+                # imports (e.g. ``from configuration_fast import ...``) work.
+                import sys
+                parent_dir = str(Path(fpath).parent)
+                path_added = parent_dir not in sys.path
+                if path_added:
+                    sys.path.insert(0, parent_dir)
+                module_key = hashlib.sha256(fpath.encode("utf-8")).hexdigest()[:12]
+                module_name = f"lm_eval_{label}_{Path(fpath).stem}_{module_key}"
+                spec = importlib.util.spec_from_file_location(module_name, fpath)
+                if spec is None or spec.loader is None:
+                    raise ValueError(f"Failed to load {label} module from file: {fpath}")
+                mod = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(mod)  # type: ignore[attr-defined]
+            else:
+                mod = importlib.import_module(mod_name)
+            attr = getattr(mod, attr_name, None)
+            if attr is None:
+                raise ValueError(
+                    f"{label} refers to missing attribute '{attr_name}' in module '{mod_name}'"
+                )
+            return mod, attr
+
+        # ── Optional custom model class ──
+        # If provided, this replaces `self.AUTO_MODEL_CLASS` for `from_pretrained()`.
+        #
+        # Format (same convention as custom_generate):
+        # - `custom_model_class=<python.module.path>:<ClassName>`
+        # - `custom_model_class=./path/to/file.py:<ClassName>` (loads from file)
+        self._custom_model_class_spec = model_kwargs.pop("custom_model_class", None)
+        self._custom_model_class = None
+        if self._custom_model_class_spec is not None:
+            _, cls = _resolve_dotted_import(
+                self._custom_model_class_spec, label="custom_model_class"
+            )
+            if not isinstance(cls, type):
+                raise ValueError(
+                    f"custom_model_class refers to non-class '{cls}' – expected a class"
+                )
+            self._custom_model_class = cls
+            eval_logger.info(f"Using custom model class: {cls}")
+
         # Optional custom generation routing.
         # If provided, this replaces `self.model.generate(...)` inside `_model_generate()`.
         #
@@ -577,29 +636,12 @@ class HFLM(TemplateLM):
         # Defaults that should be forwarded to the custom generator (not to from_pretrained()).
         self._custom_generate_defaults: Dict[str, object] = {}
         if self._custom_generate is not None:
-            if not isinstance(self._custom_generate, str) or ":" not in self._custom_generate:
+            _, fn = _resolve_dotted_import(
+                self._custom_generate, label="custom_generate"
+            )
+            if not callable(fn):
                 raise ValueError(
-                    "custom_generate must be a string like 'some.module:some_function'"
-                )
-            mod_name, fn_name = self._custom_generate.split(":", 1)
-            # Support loading from a local file path like ./generate.py:my_fn
-            if mod_name.endswith(".py") or "/" in mod_name or mod_name.startswith("."):
-                fpath = os.path.abspath(mod_name)
-                if not os.path.isfile(fpath):
-                    raise ValueError(f"custom_generate file not found: {mod_name}")
-                module_key = hashlib.sha256(fpath.encode("utf-8")).hexdigest()[:12]
-                module_name = f"lm_eval_custom_generate_{Path(fpath).stem}_{module_key}"
-                spec = importlib.util.spec_from_file_location(module_name, fpath)
-                if spec is None or spec.loader is None:
-                    raise ValueError(f"Failed to load custom_generate module from file: {fpath}")
-                mod = importlib.util.module_from_spec(spec)
-                spec.loader.exec_module(mod)  # type: ignore[attr-defined]
-            else:
-                mod = importlib.import_module(mod_name)
-            fn = getattr(mod, fn_name, None)
-            if fn is None or not callable(fn):
-                raise ValueError(
-                    f"custom_generate refers to non-callable '{fn_name}' in module '{mod_name}'"
+                    f"custom_generate refers to non-callable '{fn}'"
                 )
             self._custom_generate_fn = fn
 
@@ -762,7 +804,8 @@ class HFLM(TemplateLM):
                 #     rotate_model_v(self._model, config)
                 #     print("Rotated model")
             else:
-                self._model = self.AUTO_MODEL_CLASS.from_pretrained(
+                _model_cls = self._custom_model_class or self.AUTO_MODEL_CLASS
+                self._model = _model_cls.from_pretrained(
                     pretrained,
                     revision=revision,
                     torch_dtype=get_dtype(dtype),
@@ -907,7 +950,7 @@ class HFLM(TemplateLM):
                 "padding_side": "left",
                 "trust_remote_code": True,
             }
-            eval_logger.warn(f"<squat> creating tokenizer with kwargs:\n{kwargs}")
+            eval_logger.warn(f"<more-eval> creating tokenizer with kwargs:\n{kwargs}")
             
             self.tokenizer = transformers.AutoTokenizer.from_pretrained(
                 model_name, **kwargs
