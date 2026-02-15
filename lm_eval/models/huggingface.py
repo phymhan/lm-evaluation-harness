@@ -677,6 +677,24 @@ class HFLM(TemplateLM):
                 "ssd_ratio_tempering_factor",
                 "min_ssd_span_length",
                 "allow_resample",
+                # additional for SSD policy
+                "do_verify_policy",
+                "do_verify_score_threshold",
+                "hysteresis_threshold_on",
+                "hysteresis_threshold_off",
+                "token_acceptance_estimator",
+                "ssd_confidence_margin_threshold",
+                "ssd_confidence_power",
+                "ssd_entropy_threshold",
+                "ssd_confidence_margin_coef",
+                "ssd_entropy_temperature",
+                "ucb_beta",
+                "ucb_span_length_bins",
+                "ucb_block_progress_bins",
+                "ucb_entropy_bins",
+                "ucb_entropy_source",
+                "do_verify_score_type",
+                "score_penalty_coef",
             ):
                 if k in model_kwargs:
                     self._custom_generate_defaults[k] = model_kwargs.pop(k)
