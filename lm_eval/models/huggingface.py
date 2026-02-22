@@ -671,12 +671,19 @@ class HFLM(TemplateLM):
                 "small_block_size",
                 "use_block_cache",
                 "use_ssd_cache",
+                # for LLaDA 2.1
+                "editing_threshold",
+                "max_post_steps",
+                "num_to_transfer",
+                "eos_early_stop",
+                "return_stats",
                 # additional for SSD
                 "cache_ver",
                 "draft_ver",
                 "ssd_ratio_tempering_factor",
                 "min_ssd_span_length",
                 "allow_resample",
+                "legacy_ssd_span_strategy",
                 # additional for SSD policy
                 "do_verify_policy",
                 "do_verify_score_threshold",
