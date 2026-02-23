@@ -76,6 +76,7 @@ def simple_evaluate(
     torch_random_seed: int = 1234,
     fewshot_random_seed: int = 1234,
     confirm_run_unsafe_code: bool = False,
+    show_running_metrics: bool = True,
 ):
     """Instantiate and evaluate a model on a list of tasks.
 
@@ -136,6 +137,9 @@ def simple_evaluate(
         Random seed for torch. If set to None, the seed will not be set.
     :param fewshot_random_seed: int
         Random seed for fewshot sampler random generator. If set to None, the seed of generator will be set to None.
+    :param show_running_metrics: bool
+        If True, show a running average of scalar metrics (for example, accuracy/pass@1)
+        while post-processing task results on rank 0.
 
     :return
         Dictionary of results
@@ -319,6 +323,7 @@ def simple_evaluate(
         fewshot_as_multiturn=fewshot_as_multiturn,
         verbosity=verbostiy,
         confirm_run_unsafe_code=confirm_run_unsafe_code,
+        show_running_metrics=show_running_metrics,
     )
     if verbostiy is not None:
         lm_eval.setup_logging(verbosity=verbostiy)
@@ -381,6 +386,7 @@ def evaluate(
     fewshot_as_multiturn: bool = False,
     verbosity: str = "INFO",
     confirm_run_unsafe_code: bool = False,
+    show_running_metrics: bool = True,
 ):
     """Instantiate and evaluate a model on a list of tasks.
 
@@ -413,6 +419,9 @@ def evaluate(
         Verbosity level for logging
     :param confirm_run_unsafe_code: bool
         Whether to confirm running tasks marked as unsafe.
+    :param show_running_metrics: bool
+        If True, show a running average of scalar metrics while post-processing
+        examples on rank 0.
     :return
         Dictionary of results
     """
@@ -424,6 +433,7 @@ def evaluate(
 
     # tracks all Instances/requests a model must generate output on.
     requests = defaultdict(list)
+    request_to_task_output = {}
     # stores the amount to pad out reqs per req. type so that
     # number of fwd passes per distributed rank is equal
     padding_requests = defaultdict(int)
@@ -494,6 +504,7 @@ def evaluate(
         for instance in task.instances:
             reqtype = instance.request_type
             requests[reqtype].append(instance)
+            request_to_task_output[id(instance)] = task_output
 
         if lm.world_size > 1:
             instances_rnk = torch.tensor(len(task._instances), device=lm.device)
@@ -524,8 +535,73 @@ def evaluate(
             for _ in range(padding_requests[reqtype]):
                 cloned_reqs.extend([req] * req.repeats)
 
+        running_metric_totals = defaultdict(float)
+        running_metric_counts = defaultdict(int)
+
+        def _running_metric_callback(req, resp):
+            task_output = request_to_task_output.get(id(req))
+            if task_output is None:
+                return None
+
+            task = task_output.task
+            if getattr(task, "OUTPUT_TYPE", None) != "generate_until":
+                return None
+            if getattr(req, "idx", None) != 0:
+                return None
+
+            try:
+                metrics = task.process_results(req.doc, [resp])
+            except Exception:
+                return None
+
+            for metric_name, metric_value in metrics.items():
+                if isinstance(
+                    metric_value, (int, float, bool, np.integer, np.floating)
+                ):
+                    key = (task_output.task_name, metric_name)
+                    running_metric_totals[key] += float(metric_value)
+                    running_metric_counts[key] += 1
+
+            preferred = (
+                "pass@1", "pass_at_1", "pass@1,none",
+                "acc",
+                "exact_match,flexible-extract", "exact_match,strict-match",
+                "exact_match",
+            )
+            chosen_metric = None
+            for metric_name in preferred:
+                key = (task_output.task_name, metric_name)
+                if running_metric_counts.get(key, 0) > 0:
+                    chosen_metric = metric_name
+                    break
+
+            if chosen_metric is None:
+                for task_name, metric_name in running_metric_counts.keys():
+                    if task_name == task_output.task_name:
+                        chosen_metric = metric_name
+                        break
+
+            if chosen_metric is None:
+                return None
+
+            key = (task_output.task_name, chosen_metric)
+            avg = running_metric_totals[key] / running_metric_counts[key]
+            return {f"{task_output.task_name}:{chosen_metric}": f"{avg:.4f}"}
+
+        enable_generation_running_metrics = (
+            reqtype == "generate_until" and show_running_metrics and lm.rank == 0
+        )
+        if enable_generation_running_metrics:
+            setattr(lm, "_running_metric_callback", _running_metric_callback)
+
         # run requests through model
-        resps = getattr(lm, reqtype)(cloned_reqs)
+        try:
+            resps = getattr(lm, reqtype)(cloned_reqs)
+        finally:
+            if enable_generation_running_metrics and hasattr(
+                lm, "_running_metric_callback"
+            ):
+                delattr(lm, "_running_metric_callback")
 
         # put responses from model into a list of length K for each request.
         for x, req in zip(resps, cloned_reqs):
@@ -562,6 +638,7 @@ def evaluate(
                 metrics = task.process_results(
                     doc, [req.filtered_resps[filter_key] for req in requests]
                 )
+
                 if log_samples:
                     target = task.doc_to_target(doc)
                     example = {

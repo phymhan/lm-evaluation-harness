@@ -194,6 +194,12 @@ def setup_parser() -> argparse.ArgumentParser:
         help="If True, shows the the full config of all tasks at the end of the evaluation.",
     )
     parser.add_argument(
+        "--no_show_running_metrics",
+        action="store_true",
+        default=False,
+        help="Disable running metric display during post-processing (enabled by default).",
+    )
+    parser.add_argument(
         "--include_path",
         type=str,
         default=None,
@@ -411,6 +417,7 @@ def cli_evaluate(args: Union[argparse.Namespace, None] = None) -> None:
         torch_random_seed=args.seed[2],
         fewshot_random_seed=args.seed[3],
         confirm_run_unsafe_code=args.confirm_run_unsafe_code,
+        show_running_metrics=not args.no_show_running_metrics,
         **request_caching_args,
     )
 

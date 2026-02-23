@@ -1548,7 +1548,7 @@ class HFLM(TemplateLM):
     ) -> List[str]:
         res = []
 
-        def _collate(req: Tuple[str, dict]):
+        def _collate(req_item: Tuple[Tuple[str, dict], Instance]):
             """Defines the key for the sorted method"""
             # the negative sign on len(toks) sorts descending - this has a few advantages:
             # - time estimates will always be over not underestimates, which is more useful for planning
@@ -1556,6 +1556,7 @@ class HFLM(TemplateLM):
             #   padded context length. this is useful to simplify the batching logic and more importantly to make
             #   automatic adaptive batches much much easier to implement
             # - any OOMs will happen right away rather than near the end
+            req, _ = req_item
             toks = self.tok_encode(req[0])
             return -len(toks), req[0]
 
@@ -1588,17 +1589,18 @@ class HFLM(TemplateLM):
         # we group requests by their generation_kwargs,
         # so that we don't try to execute e.g. greedy sampling and temp=0.8 sampling
         # in the same batch.
-        # group_fn=lambda x: x[1] -> x=(context, gen_kwargs)
+        # group_fn=lambda x: x[0][1] -> x=((context, gen_kwargs), request)
         re_ords = Collator(
-            [reg.args for reg in requests],
+            [(reg.args, reg) for reg in requests],
             sort_fn=_collate,
             group_by="gen_kwargs",
-            group_fn=lambda x: x[1],
+            group_fn=lambda x: x[0][1],
         )
         chunks = re_ords.get_batched(n=batch_size, batch_fn=batch_fn)
         eos = self.tok_decode(self.eot_token_id, skip_special_tokens=False)
         for chunk in chunks:
-            contexts, all_gen_kwargs = zip(*chunk)
+            req_args_batch, batch_reqs = zip(*chunk)
+            contexts, all_gen_kwargs = zip(*req_args_batch)
             # we assume all gen kwargs in the batch are the same
             # this is safe to assume because the `grouper` object ensures it.
             gen_kwargs = all_gen_kwargs[0]
@@ -1648,7 +1650,7 @@ class HFLM(TemplateLM):
             )
 
             cont_toks_list = cont.tolist()
-            for cont_toks, context in zip(cont_toks_list, contexts):
+            for cont_toks, context, req in zip(cont_toks_list, contexts, batch_reqs):
                 # discard context + left-padding toks if using causal decoder-only LM
                 if self.backend == "causal":
                     cont_toks = cont_toks[context_enc.shape[1] :]
@@ -1665,6 +1667,11 @@ class HFLM(TemplateLM):
                 res.append(s)
 
                 self.cache_hook.add_partial("generate_until", (context, gen_kwargs), s)
+                running_metric_callback = getattr(self, "_running_metric_callback", None)
+                if callable(running_metric_callback):
+                    postfix = running_metric_callback(req, s)
+                    if postfix:
+                        pbar.set_postfix(postfix)
                 pbar.update(1)
         # reorder this group of results back to original unsorted form
         res = re_ords.get_original(res)
